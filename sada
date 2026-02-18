@@ -1,0 +1,361 @@
+Alright — now we’re cooking 🍳
+You want the same **LectaVera backend plan** but updated to match your new infra:
+
+> 💸 **100% Free Architecture**
+> API → Render
+> DB → Render Postgres
+> Redis → Upstash
+> Vector → Pinecone
+> Files → Supabase / Cloudinary
+
+And you’re **not using Celery**, so Redis is for:
+
+* Caching RAG results
+* Chat session memory
+* WebSocket pub/sub
+* Rate limiting
+* Processing status tracking
+* Temporary tokens / OTP / reset links
+
+Let’s update your architecture cleanly 👇
+
+---
+
+# 🧠 LectaVera Backend — Updated Architecture (With Redis)
+
+## Updated Tech Stack
+
+### Backend Core
+
+* **FastAPI**
+* **PostgreSQL (Render)** → persistent data
+* **Upstash Redis** → cache + realtime + temp state
+* **Supabase Storage** → PDFs
+* **Pinecone** → embeddings
+* **LangGraph** → CRAG workflow
+* **OpenAI / Groq** → LLM
+* **Tavily** → web search
+
+---
+
+# 🆕 Redis Responsibilities (New)
+
+We re-introduce Redis but only for **ephemeral / fast data**:
+
+| Feature                    | Stored In |
+| -------------------------- | --------- |
+| JWT blacklist              | Redis     |
+| Refresh tokens             | Postgres  |
+| Chat live memory           | Redis     |
+| Chat history archive       | Postgres  |
+| Document processing status | Redis     |
+| RAG cache                  | Redis     |
+| WebSocket pub/sub          | Redis     |
+| Rate limiting              | Redis     |
+
+Think:
+
+> Postgres = permanent brain
+> Redis = short-term memory ⚡
+
+---
+
+# 📦 Updated Requirements.txt
+
+Add Redis client:
+
+```txt
+redis==5.0.1
+hiredis==2.3.2  # Faster parsing (optional)
+```
+
+(Everything else same as your current file.)
+
+---
+
+# 🔐 Environment Variables (Updated)
+
+```env
+# Redis (Upstash)
+REDIS_URL=redis://default:password@host:port
+REDIS_CACHE_TTL=3600
+REDIS_CHAT_TTL=86400
+REDIS_RATE_LIMIT=100
+```
+
+Upstash gives this URL directly.
+
+---
+
+# 🧩 New Project Structure Changes
+
+Add Redis utilities:
+
+```
+app/
+├── core/
+│   └── redis.py          # Redis connection
+├── services/
+│   └── cache_service.py
+├── utils/
+│   └── rate_limiter.py
+```
+
+---
+
+# 1️⃣ Redis Connection
+
+**app/core/redis.py**
+
+```python
+import redis.asyncio as redis
+from app.core.config import settings
+
+redis_client = redis.from_url(
+    settings.REDIS_URL,
+    encoding="utf-8",
+    decode_responses=True
+)
+```
+
+Async client works best on Render.
+
+---
+
+# 2️⃣ RAG Response Caching
+
+Why?
+
+LLM + Pinecone = expensive + slow.
+
+Cache repeated queries.
+
+**app/services/cache_service.py**
+
+```python
+import hashlib
+import json
+from app.core.redis import redis_client
+
+CACHE_TTL = 3600  # 1 hour
+
+
+def _hash_query(query: str, user_id: str) -> str:
+    raw = f"{user_id}:{query}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+async def get_cached_rag(query: str, user_id: str):
+    key = f"rag:{_hash_query(query, user_id)}"
+    data = await redis_client.get(key)
+    return json.loads(data) if data else None
+
+
+async def set_cached_rag(query: str, user_id: str, response: dict):
+    key = f"rag:{_hash_query(query, user_id)}"
+    await redis_client.setex(
+        key,
+        CACHE_TTL,
+        json.dumps(response)
+    )
+```
+
+---
+
+## Update RAG Service
+
+```python
+from app.services.cache_service import (
+    get_cached_rag,
+    set_cached_rag
+)
+
+async def process_query(...):
+
+    cached = await get_cached_rag(question, user_id)
+    if cached:
+        return cached
+
+    result = self.graph.invoke(state)
+
+    await set_cached_rag(question, user_id, result)
+
+    return result
+```
+
+⚡ Saves tokens + Pinecone calls.
+
+---
+
+# 3️⃣ Document Processing Status (Realtime)
+
+Instead of polling DB constantly:
+
+Store status in Redis.
+
+### Update background processor
+
+```python
+from app.core.redis import redis_client
+
+status_key = f"doc_status:{doc_id}"
+
+await redis_client.set(status_key, "processing")
+
+# After completion
+await redis_client.set(status_key, "ready")
+```
+
+### API endpoint
+
+```python
+@router.get("/{document_id}/status")
+async def get_status(document_id: str):
+
+    status = await redis_client.get(
+        f"doc_status:{document_id}"
+    )
+
+    return {
+        "status": status or "processing"
+    }
+```
+
+Faster than DB polling.
+
+---
+
+# 4️⃣ Chat Live Memory (WebSocket)
+
+Store last N messages in Redis.
+
+```python
+key = f"chat_live:{session_id}"
+
+await redis_client.rpush(key, json.dumps(message))
+await redis_client.expire(key, 86400)
+```
+
+When session ends → move to Postgres archive.
+
+---
+
+# 5️⃣ Rate Limiting
+
+**app/utils/rate_limiter.py**
+
+```python
+from fastapi import HTTPException
+from app.core.redis import redis_client
+
+LIMIT = 100
+WINDOW = 60  # seconds
+
+
+async def rate_limit(user_id: str):
+
+    key = f"rate:{user_id}"
+
+    count = await redis_client.incr(key)
+
+    if count == 1:
+        await redis_client.expire(key, WINDOW)
+
+    if count > LIMIT:
+        raise HTTPException(
+            429,
+            "Rate limit exceeded"
+        )
+```
+
+Use in dependencies.
+
+---
+
+# 6️⃣ JWT Blacklist (Logout)
+
+```python
+async def blacklist_token(jti: str):
+    await redis_client.setex(
+        f"jwt_blacklist:{jti}",
+        3600,
+        "true"
+    )
+```
+
+Check on every request.
+
+---
+
+# 🧱 Updated Deployment Architecture
+
+```
+                ┌──────────────┐
+                │  Frontend    │
+                │  (Vercel)    │
+                └──────┬───────┘
+                       │
+                       ▼
+               ┌──────────────┐
+               │ FastAPI API  │
+               │   Render     │
+               └──────┬───────┘
+                      │
+     ┌────────────────┼────────────────┐
+     ▼                ▼                ▼
+Postgres         Upstash Redis     Pinecone
+(Render)          (Cache/RT)        (Vectors)
+
+                      │
+                      ▼
+               Supabase Storage
+                    (PDFs)
+```
+
+---
+
+# 🆕 Updated Infra Summary
+
+| Component | Service         | Purpose          |
+| --------- | --------------- | ---------------- |
+| API       | Render          | Backend          |
+| DB        | Render Postgres | Persistent data  |
+| Redis     | Upstash         | Cache + realtime |
+| Vector DB | Pinecone        | Embeddings       |
+| Files     | Supabase        | PDFs             |
+| LLM       | OpenAI/Groq     | Generation       |
+
+Cost → **$0 (free tiers)** 💸
+
+---
+
+# 🧭 What Changed From Your Old Plan
+
+### Added back
+
+* Redis caching
+* Redis rate limiting
+* Redis pub/sub
+* Redis doc status tracking
+
+### Still removed
+
+* Celery
+* Workers
+* Message brokers
+
+So infra stays simple.
+
+---
+
+# 🚀 When to scale later
+
+Upgrade path:
+
+| Need            | Add           |
+| --------------- | ------------- |
+| Heavy jobs      | Celery        |
+| Long PDFs       | Workers       |
+| Streaming scale | Redis cluster |
+| Analytics       | ClickHouse    |
+
